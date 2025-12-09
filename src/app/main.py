@@ -1,19 +1,20 @@
-# app/main.py
+# src/app/main.py
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from .routers import auth, user
+from .routers import auth, user, query, websocket_chat
 from .database.database import Base, engine
-from .routers import query
 
 # Crear tablas en la base de datos
 Base.metadata.create_all(bind=engine)
 
 # Crear aplicación
 app = FastAPI(
-    title="SmartHealth API - Sprint 1",
-    description="API REST para sistema de gestión de salud",
-    version="1.0.0"
+    title="SmartHealth API",
+    description="API REST y WebSocket para sistema de gestión de salud con RAG",
+    version="2.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
 )
 
 # Configurar CORS (permitir peticiones desde frontend)
@@ -29,20 +30,37 @@ app.add_middleware(
 app.include_router(auth.router)
 app.include_router(user.router)
 app.include_router(query.router)
+app.include_router(websocket_chat.router)
 
 # Endpoint raíz
 @app.get("/", tags=["Root"])
 def root():
     return {
         "message": "¡API SmartHealth funcionando correctamente!",
-        "docs": "/docs"
+        "version": "2.0.0",
+        "features": {
+            "rest_api": True,
+            "websocket": True,
+            "rag_enabled": True,
+            "streaming": True
+        },
+        "endpoints": {
+            "docs": "/docs",
+            "redoc": "/redoc",
+            "websocket": "ws://localhost:8088/ws/chat",
+            "health": "/health"
+        }
     }
 
 # Health check
 @app.get("/health", tags=["Health"])
 def health():
-    return {"status": "healthy"}
-
-@app.get("/")
-def root():
-    return {"message": "Smart Health RAG API - Running ✅"}
+    return {
+        "status": "healthy",
+        "websocket_enabled": True,
+        "services": {
+            "database": "connected",
+            "llm": "ready",
+            "vector_search": "ready"
+        }
+    }
