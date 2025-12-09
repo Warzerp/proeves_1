@@ -1,0 +1,906 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Health - Chat IA</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+        
+        /* ============================================ */
+        /* PANTALLA DE LOGIN */
+        /* ============================================ */
+        
+        .login-container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 400px;
+            width: 100%;
+        }
+        
+        .login-header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
+        
+        .login-header h1 {
+            color: #667eea;
+            margin-bottom: 10px;
+            font-size: 28px;
+        }
+        
+        .login-header p {
+            color: #666;
+            font-size: 14px;
+        }
+        
+        .form-group {
+            margin-bottom: 20px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #333;
+            font-size: 14px;
+        }
+        
+        .form-group input {
+            width: 100%;
+            padding: 12px 15px;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
+        
+        .form-group input:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+        
+        .btn-login {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        
+        .btn-login:hover {
+            transform: translateY(-2px);
+        }
+        
+        .btn-login:active {
+            transform: translateY(0);
+        }
+        
+        .btn-login:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        .error-message {
+            background: #ffebee;
+            color: #c62828;
+            padding: 12px;
+            border-radius: 8px;
+            margin-top: 15px;
+            font-size: 14px;
+            display: none;
+        }
+        
+        .error-message.show {
+            display: block;
+        }
+        
+        /* ============================================ */
+        /* PANTALLA DE CHAT */
+        /* ============================================ */
+        
+        .chat-container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 900px;
+            width: 100%;
+            height: 85vh;
+            display: none;
+            flex-direction: column;
+        }
+        
+        .chat-container.active {
+            display: flex;
+        }
+        
+        /* Header del chat */
+        .chat-header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px 25px;
+            border-radius: 20px 20px 0 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .chat-header-info h2 {
+            margin-bottom: 5px;
+            font-size: 20px;
+        }
+        
+        .chat-header-info p {
+            opacity: 0.9;
+            font-size: 13px;
+        }
+        
+        .btn-logout {
+            background: rgba(255,255,255,0.2);
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background 0.3s;
+        }
+        
+        .btn-logout:hover {
+            background: rgba(255,255,255,0.3);
+        }
+        
+        /* Configuración del paciente */
+        .patient-config {
+            background: #f8f9fa;
+            padding: 20px 25px;
+            border-bottom: 1px solid #e0e0e0;
+            display: grid;
+            grid-template-columns: 1fr 2fr;
+            gap: 15px;
+        }
+        
+        .patient-config select,
+        .patient-config input {
+            padding: 10px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+        }
+        
+        .patient-config select:focus,
+        .patient-config input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        /* Mensajes */
+        .messages-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 25px;
+            background: #f8f9fa;
+        }
+        
+        .message {
+            margin-bottom: 20px;
+            display: flex;
+            gap: 12px;
+            animation: slideIn 0.3s ease;
+        }
+        
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        .message-avatar {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            flex-shrink: 0;
+        }
+        
+        .message.user .message-avatar {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+        
+        .message.assistant .message-avatar {
+            background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+        }
+        
+        .message-content {
+            flex: 1;
+        }
+        
+        .message-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 5px;
+        }
+        
+        .message-sender {
+            font-weight: 600;
+            font-size: 14px;
+            color: #333;
+        }
+        
+        .message-time {
+            font-size: 12px;
+            color: #999;
+        }
+        
+        .message-text {
+            background: white;
+            padding: 12px 16px;
+            border-radius: 0 12px 12px 12px;
+            line-height: 1.6;
+            color: #333;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            white-space: pre-wrap;
+        }
+        
+        .message.user .message-text {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 12px 0 12px 12px;
+        }
+        
+        /* Status indicator */
+        .status-indicator {
+            padding: 10px 20px;
+            background: #e3f2fd;
+            color: #1976d2;
+            border-radius: 8px;
+            margin: 10px 0;
+            font-size: 13px;
+            text-align: center;
+            display: none;
+        }
+        
+        .status-indicator.show {
+            display: block;
+        }
+        
+        /* Typing indicator */
+        .typing-indicator {
+            display: none;
+            padding: 15px;
+        }
+        
+        .typing-indicator.show {
+            display: flex;
+            gap: 12px;
+        }
+        
+        .typing-dots {
+            display: flex;
+            gap: 4px;
+            padding: 12px 16px;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        }
+        
+        .typing-dots span {
+            width: 8px;
+            height: 8px;
+            background: #667eea;
+            border-radius: 50%;
+            animation: typing 1.4s infinite;
+        }
+        
+        .typing-dots span:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+        
+        .typing-dots span:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+        
+        @keyframes typing {
+            0%, 60%, 100% {
+                transform: translateY(0);
+            }
+            30% {
+                transform: translateY(-10px);
+            }
+        }
+        
+        /* Input area */
+        .input-area {
+            padding: 20px 25px;
+            background: white;
+            border-top: 1px solid #e0e0e0;
+            border-radius: 0 0 20px 20px;
+        }
+        
+        .input-wrapper {
+            display: flex;
+            gap: 12px;
+        }
+        
+        .input-wrapper textarea {
+            flex: 1;
+            padding: 12px 16px;
+            border: 2px solid #e0e0e0;
+            border-radius: 12px;
+            font-size: 14px;
+            font-family: inherit;
+            resize: none;
+            min-height: 50px;
+            max-height: 120px;
+            transition: border-color 0.3s;
+        }
+        
+        .input-wrapper textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .btn-send {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 0 24px;
+            border-radius: 12px;
+            font-size: 20px;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        
+        .btn-send:hover {
+            transform: scale(1.05);
+        }
+        
+        .btn-send:active {
+            transform: scale(0.95);
+        }
+        
+        .btn-send:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        /* Metadata box */
+        .metadata-box {
+            background: #f0f4ff;
+            border-left: 4px solid #667eea;
+            padding: 12px 16px;
+            border-radius: 0 8px 8px 0;
+            margin-top: 10px;
+            font-size: 12px;
+            color: #555;
+        }
+        
+        .metadata-box strong {
+            color: #333;
+        }
+        
+        /* Hidden class */
+        .hidden {
+            display: none !important;
+        }
+        
+        /* Scrollbar personalizado */
+        .messages-container::-webkit-scrollbar {
+            width: 8px;
+        }
+        
+        .messages-container::-webkit-scrollbar-track {
+            background: #f1f1f1;
+        }
+        
+        .messages-container::-webkit-scrollbar-thumb {
+            background: #c1c1c1;
+            border-radius: 4px;
+        }
+        
+        .messages-container::-webkit-scrollbar-thumb:hover {
+            background: #a1a1a1;
+        }
+    </style>
+</head>
+<body>
+    <!-- ============================================ -->
+    <!-- PANTALLA DE LOGIN -->
+    <!-- ============================================ -->
+    <div class="login-container" id="loginScreen">
+        <div class="login-header">
+            <h1>🏥 Smart Health</h1>
+            <p>Inicia sesión para acceder al chat médico</p>
+        </div>
+        
+        <form id="loginForm" onsubmit="handleLogin(event)">
+            <div class="form-group">
+                <label for="email">📧 Correo Electrónico</label>
+                <input 
+                    type="email" 
+                    id="email" 
+                    placeholder="usuario@ejemplo.com"
+                    required
+                >
+            </div>
+            
+            <div class="form-group">
+                <label for="password">🔒 Contraseña</label>
+                <input 
+                    type="password" 
+                    id="password" 
+                    placeholder="••••••••"
+                    required
+                >
+            </div>
+            
+            <button type="submit" class="btn-login" id="loginBtn">
+                🚀 Iniciar Sesión
+            </button>
+            
+            <div class="error-message" id="loginError"></div>
+        </form>
+    </div>
+    
+    <!-- ============================================ -->
+    <!-- PANTALLA DE CHAT -->
+    <!-- ============================================ -->
+    <div class="chat-container" id="chatScreen">
+        <!-- Header -->
+        <div class="chat-header">
+            <div class="chat-header-info">
+                <h2>💬 Chat Médico IA</h2>
+                <p id="userEmail"></p>
+            </div>
+            <button class="btn-logout" onclick="handleLogout()">
+                🚪 Cerrar Sesión
+            </button>
+        </div>
+        
+        <!-- Configuración del paciente -->
+        <div class="patient-config">
+            <select id="docType">
+                <option value="1">CC - Cédula</option>
+                <option value="2">CE - Extranjería</option>
+                <option value="3">TI - Tarjeta Identidad</option>
+                <option value="4">PA - Pasaporte</option>
+                <option value="8">CD - Carné Diplomático</option>
+            </select>
+            <input 
+                type="text" 
+                id="docNumber" 
+                placeholder="Número de documento del paciente"
+            >
+        </div>
+        
+        <!-- Mensajes -->
+        <div class="messages-container" id="messagesContainer">
+            <div class="message assistant">
+                <div class="message-avatar">🤖</div>
+                <div class="message-content">
+                    <div class="message-header">
+                        <span class="message-sender">Asistente Médico</span>
+                        <span class="message-time" id="welcomeTime"></span>
+                    </div>
+                    <div class="message-text">
+                        ¡Hola! Soy tu asistente médico inteligente. 👋
+                        
+Puedo ayudarte a consultar información sobre:
+- 📅 Citas médicas
+- 💊 Medicamentos y prescripciones
+- 🩺 Diagnósticos
+- 📋 Historia clínica
+
+Ingresa el documento del paciente arriba y hazme tu pregunta.
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Status indicator -->
+        <div class="status-indicator" id="statusIndicator"></div>
+        
+        <!-- Typing indicator -->
+        <div class="typing-indicator" id="typingIndicator">
+            <div class="message-avatar">🤖</div>
+            <div class="typing-dots">
+                <span></span>
+                <span></span>
+                <span></span>
+            </div>
+        </div>
+        
+        <!-- Input -->
+        <div class="input-area">
+            <div class="input-wrapper">
+                <textarea 
+                    id="messageInput" 
+                    placeholder="Escribe tu pregunta aquí..."
+                    onkeydown="handleKeyPress(event)"
+                ></textarea>
+                <button class="btn-send" id="sendBtn" onclick="sendMessage()">
+                    🚀
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ============================================
+        // VARIABLES GLOBALES
+        // ============================================
+        
+        let authToken = null;
+        let ws = null;
+        let currentUserEmail = null;
+        
+        const API_BASE = 'http://localhost:8088';
+        const WS_BASE = 'ws://localhost:8088';
+        
+        // ============================================
+        // FUNCIONES DE LOGIN
+        // ============================================
+        
+        async function handleLogin(event) {
+            event.preventDefault();
+            
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            const loginBtn = document.getElementById('loginBtn');
+            const errorDiv = document.getElementById('loginError');
+            
+            // Deshabilitar botón
+            loginBtn.disabled = true;
+            loginBtn.textContent = '⏳ Iniciando sesión...';
+            errorDiv.classList.remove('show');
+            
+            try {
+                const response = await fetch(`${API_BASE}/auth/login`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ email, password })
+                });
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    authToken = data.access_token;
+                    currentUserEmail = email;
+                    
+                    // Mostrar chat
+                    document.getElementById('loginScreen').style.display = 'none';
+                    document.getElementById('chatScreen').classList.add('active');
+                    document.getElementById('userEmail').textContent = email;
+                    document.getElementById('welcomeTime').textContent = getCurrentTime();
+                    
+                    // Conectar WebSocket
+                    connectWebSocket();
+                    
+                } else {
+                    const error = await response.json();
+                    showError(error.detail || 'Credenciales incorrectas');
+                }
+                
+            } catch (error) {
+                showError('Error de conexión. ¿Está corriendo FastAPI?');
+                console.error('Error:', error);
+            } finally {
+                loginBtn.disabled = false;
+                loginBtn.textContent = '🚀 Iniciar Sesión';
+            }
+        }
+        
+        function showError(message) {
+            const errorDiv = document.getElementById('loginError');
+            errorDiv.textContent = `❌ ${message}`;
+            errorDiv.classList.add('show');
+        }
+        
+        function handleLogout() {
+            if (ws) {
+                ws.close();
+            }
+            authToken = null;
+            currentUserEmail = null;
+            
+            document.getElementById('chatScreen').classList.remove('active');
+            document.getElementById('loginScreen').style.display = 'block';
+            
+            // Limpiar formulario
+            document.getElementById('email').value = '';
+            document.getElementById('password').value = '';
+            
+            // Limpiar mensajes (excepto el de bienvenida)
+            const container = document.getElementById('messagesContainer');
+            const messages = container.querySelectorAll('.message');
+            messages.forEach((msg, index) => {
+                if (index > 0) msg.remove();
+            });
+        }
+        
+        // ============================================
+        // FUNCIONES DE WEBSOCKET
+        // ============================================
+        
+        function connectWebSocket() {
+            if (!authToken) return;
+            
+            const wsUrl = `${WS_BASE}/ws/chat?token=${authToken}`;
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = () => {
+                console.log('✅ WebSocket conectado');
+            };
+            
+            ws.onmessage = handleWebSocketMessage;
+            
+            ws.onerror = (error) => {
+                console.error('❌ Error WebSocket:', error);
+                showStatus('Error de conexión con el servidor', 'error');
+            };
+            
+            ws.onclose = () => {
+                console.log('🔌 WebSocket desconectado');
+            };
+        }
+        
+        let currentResponse = "";
+        let currentMessageDiv = null;
+        
+        function handleWebSocketMessage(event) {
+            const data = JSON.parse(event.data);
+            
+            switch(data.type) {
+                case 'connected':
+                    console.log('✅', data.message);
+                    break;
+                    
+                case 'status':
+                    showStatus(data.message);
+                    break;
+                    
+                case 'stream_start':
+                    currentResponse = "";
+                    currentMessageDiv = addAssistantMessage('');
+                    showTyping(false);
+                    break;
+                    
+                case 'token':
+                    currentResponse += data.token;
+                    if (currentMessageDiv) {
+                        const textDiv = currentMessageDiv.querySelector('.message-text');
+                        textDiv.textContent = currentResponse;
+                        scrollToBottom();
+                    }
+                    break;
+                    
+                case 'stream_end':
+                    hideStatus();
+                    break;
+                    
+                case 'complete':
+                    // Agregar metadata
+                    if (currentMessageDiv) {
+                        const meta = data.metadata;
+                        const patient = data.patient_info;
+                        const metaBox = document.createElement('div');
+                        metaBox.className = 'metadata-box';
+                        metaBox.innerHTML = `
+                            <strong>📊 Información:</strong><br>
+                            • Paciente: ${patient.full_name}<br>
+                            • Registros: ${meta.total_records_analyzed} | 
+                            Tiempo: ${meta.query_time_ms}ms | 
+                            Confianza: ${(data.answer.confidence * 100).toFixed(0)}%
+                        `;
+                        currentMessageDiv.querySelector('.message-content').appendChild(metaBox);
+                    }
+                    
+                    enableInput();
+                    hideStatus();
+                    break;
+                    
+                case 'error':
+                    const errorMsg = data.error.message;
+                    addAssistantMessage(`❌ Error: ${errorMsg}`);
+                    enableInput();
+                    hideStatus();
+                    showTyping(false);
+                    break;
+            }
+        }
+        
+        // ============================================
+        // FUNCIONES DE MENSAJES
+        // ============================================
+        
+        function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const docType = document.getElementById('docType').value;
+            const docNumber = document.getElementById('docNumber').value.trim();
+            const question = input.value.trim();
+            
+            if (!docNumber) {
+                alert('Por favor ingresa el número de documento del paciente');
+                return;
+            }
+            
+            if (!question) {
+                return;
+            }
+            
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('No hay conexión con el servidor');
+                return;
+            }
+            
+            // Agregar mensaje del usuario
+            addUserMessage(question);
+            
+            // Limpiar input
+            input.value = '';
+            
+            // Deshabilitar input
+            disableInput();
+            showTyping(true);
+            
+            // Enviar query
+            const query = {
+                type: "query",
+                session_id: `session-${Date.now()}`,
+                document_type_id: parseInt(docType),
+                document_number: docNumber,
+                question: question
+            };
+            
+            ws.send(JSON.stringify(query));
+        }
+        
+        function addUserMessage(text) {
+            const container = document.getElementById('messagesContainer');
+            
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message user';
+            messageDiv.innerHTML = `
+                <div class="message-avatar">👤</div>
+                <div class="message-content">
+                    <div class="message-header">
+                        <span class="message-sender">Tú</span>
+                        <span class="message-time">${getCurrentTime()}</span>
+                    </div>
+                    <div class="message-text">${escapeHtml(text)}</div>
+                </div>
+            `;
+            
+            container.appendChild(messageDiv);
+            scrollToBottom();
+        }
+        
+        function addAssistantMessage(text) {
+            const container = document.getElementById('messagesContainer');
+            
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message assistant';
+            messageDiv.innerHTML = `
+                <div class="message-avatar">🤖</div>
+                <div class="message-content">
+                    <div class="message-header">
+                        <span class="message-sender">Asistente Médico</span>
+                        <span class="message-time">${getCurrentTime()}</span>
+                    </div>
+                    <div class="message-text">${escapeHtml(text)}</div>
+                </div>
+            `;
+            
+            container.appendChild(messageDiv);
+            scrollToBottom();
+            
+            return messageDiv;
+        }
+        
+        // ============================================
+        // FUNCIONES AUXILIARES
+        // ============================================
+        
+        function disableInput() {
+            document.getElementById('messageInput').disabled = true;
+            document.getElementById('sendBtn').disabled = true;
+        }
+        
+        function enableInput() {
+            document.getElementById('messageInput').disabled = false;
+            document.getElementById('sendBtn').disabled = false;
+            document.getElementById('messageInput').focus();
+        }
+        
+        function showStatus(message) {
+            const status = document.getElementById('statusIndicator');
+            status.textContent = message;
+            status.classList.add('show');
+        }
+        
+        function hideStatus() {
+            const status = document.getElementById('statusIndicator');
+            status.classList.remove('show');
+        }
+        
+        function showTyping(show) {
+            const typing = document.getElementById('typingIndicator');
+            if (show) {
+                typing.classList.add('show');
+                scrollToBottom();
+            } else {
+                typing.classList.remove('show');
+            }
+        }
+        
+        function scrollToBottom() {
+            const container = document.getElementById('messagesContainer');
+            setTimeout(() => {
+                container.scrollTop = container.scrollHeight;
+            }, 100);
+        }
+        
+        function getCurrentTime() {
+            const now = new Date();
+            return now.toLocaleTimeString('es-ES', { 
+                hour: '2-digit', 
+                minute: '2-digit' 
+            });
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        function handleKeyPress(event) {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                sendMessage();
+            }
+        }
+        
+        // Auto-resize textarea
+        document.addEventListener('DOMContentLoaded', () => {
+            const textarea = document.getElementById('messageInput');
+            textarea.addEventListener('input', function() {
+                this.style.height = 'auto';
+                this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+            });
+        });
+    </script>
+</body>
+</html>
