@@ -9,11 +9,17 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from ..database.database import get_db
 from ..models.user import User
+from ..database.db_config import settings
+import secrets
 
-# Configuración
-SECRET_KEY = "7c92e93af3218c22c0eb3a65871cebd2eede4f7455f64e82fbc7282f29a01be4"  # ⚠️ CAMBIAR EN PRODUCCIÓN
+# SEGURIDAD: Usar variable de entorno en lugar de hardcodear
+SECRET_KEY = settings.secret_key
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# Validar que SECRET_KEY sea suficientemente segura
+if len(SECRET_KEY) < 32:
+    raise ValueError("SECRET_KEY debe tener al menos 32 caracteres")
 
 # Contexto de encriptación para passwords
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -159,7 +165,6 @@ def get_current_user(
 def get_current_active_user(current_user: User = Depends(get_current_user)) -> User:
     """
     Dependency adicional que verifica que el usuario esté activo.
-    (Redundante con get_current_user pero útil para claridad)
     """
     if not current_user.is_active:
         raise HTTPException(
@@ -167,3 +172,20 @@ def get_current_active_user(current_user: User = Depends(get_current_user)) -> U
             detail="Usuario inactivo"
         )
     return current_user
+
+
+# ============================================================
+# FUNCIONES DE UTILIDAD PARA SEGURIDAD
+# ============================================================
+
+def generate_secure_token(length: int = 32) -> str:
+    """
+    Genera un token seguro aleatorio.
+    
+    Args:
+        length: Longitud del token en bytes
+        
+    Returns:
+        Token hexadecimal seguro
+    """
+    return secrets.token_hex(length)

@@ -1,19 +1,18 @@
-# app/routers/user.py
+# src/app/routers/user.py
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from typing import List
-from ..schemas.user import UserResponse, UserUpdate
-from ..database.database import get_db
-from ..services.user import UserService
-from ..core.security import get_current_user
-from ..models.user import User
+from app.schemas.user import UserResponse, UserUpdate
+from app.database.database import get_db
+from app.services.user import UserService  # ← Import directo
+from app.core.security import get_current_user
+from app.models.user import User
 
 router = APIRouter(
     prefix="/users",
     tags=["Users"]
 )
-
 
 
 @router.get(
@@ -94,7 +93,6 @@ def update_user(
     Solo el mismo usuario o un administrador pueden actualizar.
     """
     # Verificar que el usuario solo pueda actualizar su propio perfil
-    # (o agregar lógica de roles si tienes administradores)
     if current_user.user_id != user_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -198,5 +196,4 @@ def deactivate_user(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error al desactivar usuario: {str(e)}"
-
         )
