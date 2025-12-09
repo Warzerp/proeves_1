@@ -1,591 +1,906 @@
-# src/app/routers/websocket_chat.py
-"""
-WebSocket endpoint para chat en tiempo real con streaming de respuestas.
-Permite consultas RAG con tokens generados en tiempo real.
-"""
-
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Depends, status
-from sqlalchemy.orm import Session
-from typing import Optional, Dict
-import json
-import logging
-import asyncio
-from datetime import datetime
-import uuid
-
-from app.services.llm_service import llm_service
-from app.services.clinical_service import fetch_patient_and_records
-from app.services.vector_search import search_similar_chunks
-from app.database.database import get_db
-from app.services.auth_utils import verify_token  # ← CORREGIDO: auth_utils en vez de auth
-
-router = APIRouter(prefix="/ws", tags=["WebSocket"])
-logger = logging.getLogger(__name__)
-
-# ============================================================================
-# CONFIGURACIÓN DE TIMEOUTS
-# ============================================================================
-VECTOR_SEARCH_TIMEOUT = 10
-LLM_TIMEOUT = 45
-TOTAL_REQUEST_TIMEOUT = 60
-
-# ============================================================================
-# CONNECTION MANAGER
-# ============================================================================
-
-class ConnectionManager:
-    """Gestiona conexiones WebSocket activas"""
-    
-    def __init__(self):
-        self.active_connections: Dict[str, WebSocket] = {}
-    
-    async def connect(self, websocket: WebSocket, session_id: str):
-        """Acepta y registra una nueva conexión"""
-        await websocket.accept()
-        self.active_connections[session_id] = websocket
-        logger.info(f"✅ WebSocket conectado - Session: {session_id}")
-    
-    def disconnect(self, session_id: str):
-        """Elimina una conexión del registro"""
-        if session_id in self.active_connections:
-            del self.active_connections[session_id]
-            logger.info(f"🔌 WebSocket desconectado - Session: {session_id}")
-    
-    async def send_json(self, session_id: str, message: dict):
-        """Envía mensaje JSON a una sesión específica"""
-        if session_id in self.active_connections:
-            websocket = self.active_connections[session_id]
-            try:
-                await websocket.send_json(message)
-            except Exception as e:
-                logger.error(f"Error enviando mensaje a {session_id}: {e}")
-    
-    async def send_text(self, session_id: str, text: str):
-        """Envía texto plano a una sesión específica"""
-        if session_id in self.active_connections:
-            websocket = self.active_connections[session_id]
-            try:
-                await websocket.send_text(text)
-            except Exception as e:
-                logger.error(f"Error enviando texto a {session_id}: {e}")
-
-
-manager = ConnectionManager()
-
-
-# ============================================================================
-# FUNCIONES AUXILIARES
-# ============================================================================
-
-def get_document_type_name(document_type_id: int) -> str:
-    """Mapea ID de tipo de documento a nombre"""
-    types = {
-        1: "CC", 2: "CE", 3: "TI", 4: "PA",
-        5: "RC", 6: "MS", 7: "AS", 8: "CD",
-    }
-    return types.get(document_type_id, "CC")
-
-
-def build_context_from_real_data(patient_info, clinical_records, similar_chunks) -> str:
-    """
-    Construye el contexto clínico de manera segura.
-    Reutiliza la lógica de query.py pero simplificada.
-    """
-    from datetime import date, datetime
-
-    # Calcular edad
-    age = "No disponible"
-    if patient_info.birth_date:
-        try:
-            birth_date = (
-                patient_info.birth_date
-                if isinstance(patient_info.birth_date, date)
-                else datetime.strptime(patient_info.birth_date, "%Y-%m-%d").date()
-            )
-            today = date.today()
-            age = today.year - birth_date.year - (
-                (today.month, today.day) < (birth_date.month, birth_date.day)
-            )
-        except Exception as e:
-            logger.warning(f"Error calculando edad: {e}")
-
-    # Información básica
-    first_name = getattr(patient_info, 'first_name', 'Nombre')
-    first_surname = getattr(patient_info, 'first_surname', 'Apellido')
-    document_number = getattr(patient_info, 'document_number', 'No disponible')
-    gender = getattr(patient_info, 'gender', None) or "No registrado"
-
-    context = f"""
-### INFORMACIÓN BÁSICA DEL PACIENTE
-Nombre: {first_name} {first_surname}
-Edad: {age}
-Documento: {document_number}
-Género: {gender}
-
-"""
-
-    # Citas médicas
-    if clinical_records.appointments:
-        context += "### CITAS MÉDICAS RECIENTES\n"
-        for apt in clinical_records.appointments[:10]:
-            apt_date = getattr(apt, 'appointment_date', 'Fecha no disponible')
-            apt_status = getattr(apt, 'status', None) or 'No disponible'
-            apt_reason = getattr(apt, 'reason', None) or 'No especificado'
-            doctor_name = getattr(apt, 'doctor_name', None)
-            
-            context += f"**Cita {apt_date}**\n"
-            context += f"- Estado: {apt_status}\n"
-            context += f"- Motivo: {apt_reason}\n"
-            if doctor_name:
-                context += f"- Doctor: {doctor_name}\n"
-            context += "\n"
-
-    # Diagnósticos
-    if clinical_records.diagnoses:
-        context += "### DIAGNÓSTICOS\n"
-        for diag in clinical_records.diagnoses[:15]:
-            diag_desc = getattr(diag, 'description', 'Diagnóstico sin descripción')
-            icd_code = getattr(diag, 'icd_code', 'Sin código')
-            context += f"**{diag_desc}** (ICD-10: {icd_code})\n"
-
-    # Prescripciones
-    if clinical_records.prescriptions:
-        context += "\n### MEDICAMENTOS\n"
-        for presc in clinical_records.prescriptions[:15]:
-            medication = getattr(presc, 'medication_name', 'Medicamento sin nombre')
-            dosage = getattr(presc, 'dosage', '')
-            frequency = getattr(presc, 'frequency', '')
-            context += f"- {medication}"
-            if dosage or frequency:
-                context += f" ({dosage} {frequency})"
-            context += "\n"
-
-    # Búsqueda vectorial
-    if similar_chunks:
-        context += "\n### INFORMACIÓN ADICIONAL RELEVANTE\n"
-        for chunk in similar_chunks[:5]:
-            chunk_text = getattr(chunk, 'chunk_text', 'Texto no disponible')
-            relevance = getattr(chunk, 'relevance_score', 0.0)
-            context += f"[Relevancia: {relevance:.2f}] {chunk_text}\n\n"
-
-    return context
-
-
-async def authenticate_websocket(websocket: WebSocket) -> Optional[Dict]:
-    """
-    Autentica WebSocket usando JWT del query parameter o header.
-    Retorna user_data si es válido, None si no.
-    """
-    try:
-        # Intentar obtener token de query params
-        token = websocket.query_params.get("token")
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smart Health - Chat IA</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
         
-        if not token:
-            # Intentar obtener de headers
-            auth_header = websocket.headers.get("authorization")
-            if auth_header and auth_header.startswith("Bearer "):
-                token = auth_header.split(" ")[1]
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
         
-        if not token:
-            logger.warning("WebSocket: No se encontró token")
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return None
+        /* ============================================ */
+        /* PANTALLA DE LOGIN */
+        /* ============================================ */
         
-        # Verificar token
-        user_data = verify_token(token)
-        if not user_data:
-            logger.warning("WebSocket: Token inválido")
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return None
+        .login-container {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 400px;
+            width: 100%;
+        }
         
-        logger.info(f"✅ Usuario autenticado: {user_data.get('user_id')}")
-        return user_data
-    
-    except Exception as e:
-        logger.error(f"Error en autenticación WebSocket: {type(e).__name__}")
-        try:
-            await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
-        except:
-            pass
-        return None
-
-
-async def stream_llm_response(
-    websocket: WebSocket,
-    question: str,
-    context: str,
-    session_id: str
-) -> Optional[str]:
-    """
-    Genera respuesta del LLM con streaming token por token.
-    Retorna el texto completo al final.
-    """
-    try:
-        logger.info(f"🎬 Iniciando streaming LLM - Session: {session_id}")
+        .login-header {
+            text-align: center;
+            margin-bottom: 30px;
+        }
         
-        # System prompt
-        system_prompt = """Eres un asistente médico inteligente especializado en analizar historias clínicas.
-
-Tu función es responder preguntas sobre pacientes basándote ÚNICAMENTE en la información proporcionada en el contexto clínico.
-
-REGLAS DE FORMATO:
-1. Usa formato Markdown para estructurar tu respuesta
-2. Usa negritas (**texto**) para fechas, diagnósticos y medicamentos importantes
-3. Enumera items cuando hay múltiples elementos (1., 2., 3.)
-4. Usa viñetas (-) para sub-items y detalles
-5. Incluye códigos ICD-10 cuando menciones diagnósticos
-6. Organiza la información cronológicamente (más reciente primero)
-
-REGLAS DE CONTENIDO:
-1. Responde SOLO con información que esté explícitamente en el contexto
-2. Si no hay información suficiente, indícalo claramente
-3. Usa un lenguaje claro, profesional y preciso
-4. NO inventes información
-5. Sé conciso pero completo"""
-
-        user_message = f"""CONTEXTO CLÍNICO:
-{context}
-
-PREGUNTA DEL USUARIO:
-{question}
-
-Por favor, responde basándote únicamente en la información del contexto clínico proporcionado."""
-
-        # Llamada a OpenAI con streaming
-        stream = await llm_service.client.chat.completions.create(
-            model=llm_service.model,
-            max_completion_tokens=2000,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message}
-            ],
-            temperature=0.3,
-            stream=True
-        )
+        .login-header h1 {
+            color: #667eea;
+            margin-bottom: 10px;
+            font-size: 28px;
+        }
         
-        full_response = ""
+        .login-header p {
+            color: #666;
+            font-size: 14px;
+        }
         
-        # Enviar inicio del stream
-        await websocket.send_json({
-            "type": "stream_start",
-            "session_id": session_id,
-            "timestamp": datetime.utcnow().isoformat() + "Z"
-        })
+        .form-group {
+            margin-bottom: 20px;
+        }
         
-        # Procesar stream token por token
-        async for chunk in stream:
-            if chunk.choices and len(chunk.choices) > 0:
-                delta = chunk.choices[0].delta
-                
-                if hasattr(delta, 'content') and delta.content:
-                    token = delta.content
-                    full_response += token
-                    
-                    # Enviar token individual
-                    await websocket.send_json({
-                        "type": "token",
-                        "token": token,
-                        "session_id": session_id
-                    })
+        .form-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: #333;
+            font-size: 14px;
+        }
         
-        # Enviar fin del stream
-        await websocket.send_json({
-            "type": "stream_end",
-            "session_id": session_id,
-            "timestamp": datetime.utcnow().isoformat() + "Z"
-        })
+        .form-group input {
+            width: 100%;
+            padding: 12px 15px;
+            border: 2px solid #e0e0e0;
+            border-radius: 10px;
+            font-size: 14px;
+            transition: all 0.3s;
+        }
         
-        logger.info(f"✅ Streaming completado - Session: {session_id}")
-        return full_response
-    
-    except asyncio.TimeoutError:
-        logger.error(f"⏱️ Timeout en streaming LLM - Session: {session_id}")
-        await websocket.send_json({
-            "type": "error",
-            "error": {
-                "code": "LLM_TIMEOUT",
-                "message": "El modelo tardó demasiado en responder"
+        .form-group input:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+        
+        .btn-login {
+            width: 100%;
+            padding: 15px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        
+        .btn-login:hover {
+            transform: translateY(-2px);
+        }
+        
+        .btn-login:active {
+            transform: translateY(0);
+        }
+        
+        .btn-login:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        .error-message {
+            background: #ffebee;
+            color: #c62828;
+            padding: 12px;
+            border-radius: 8px;
+            margin-top: 15px;
+            font-size: 14px;
+            display: none;
+        }
+        
+        .error-message.show {
+            display: block;
+        }
+        
+        /* ============================================ */
+        /* PANTALLA DE CHAT */
+        /* ============================================ */
+        
+        .chat-container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 900px;
+            width: 100%;
+            height: 85vh;
+            display: none;
+            flex-direction: column;
+        }
+        
+        .chat-container.active {
+            display: flex;
+        }
+        
+        /* Header del chat */
+        .chat-header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px 25px;
+            border-radius: 20px 20px 0 0;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .chat-header-info h2 {
+            margin-bottom: 5px;
+            font-size: 20px;
+        }
+        
+        .chat-header-info p {
+            opacity: 0.9;
+            font-size: 13px;
+        }
+        
+        .btn-logout {
+            background: rgba(255,255,255,0.2);
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background 0.3s;
+        }
+        
+        .btn-logout:hover {
+            background: rgba(255,255,255,0.3);
+        }
+        
+        /* Configuración del paciente */
+        .patient-config {
+            background: #f8f9fa;
+            padding: 20px 25px;
+            border-bottom: 1px solid #e0e0e0;
+            display: grid;
+            grid-template-columns: 1fr 2fr;
+            gap: 15px;
+        }
+        
+        .patient-config select,
+        .patient-config input {
+            padding: 10px;
+            border: 2px solid #e0e0e0;
+            border-radius: 8px;
+            font-size: 14px;
+        }
+        
+        .patient-config select:focus,
+        .patient-config input:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        /* Mensajes */
+        .messages-container {
+            flex: 1;
+            overflow-y: auto;
+            padding: 25px;
+            background: #f8f9fa;
+        }
+        
+        .message {
+            margin-bottom: 20px;
+            display: flex;
+            gap: 12px;
+            animation: slideIn 0.3s ease;
+        }
+        
+        @keyframes slideIn {
+            from {
+                opacity: 0;
+                transform: translateY(10px);
             }
-        })
-        return None
-    
-    except Exception as e:
-        logger.error(f"❌ Error en streaming LLM: {type(e).__name__}: {e}")
-        await websocket.send_json({
-            "type": "error",
-            "error": {
-                "code": "LLM_ERROR",
-                "message": f"Error generando respuesta: {str(e)}"
+            to {
+                opacity: 1;
+                transform: translateY(0);
             }
-        })
-        return None
-
-
-# ============================================================================
-# ENDPOINT WEBSOCKET PRINCIPAL
-# ============================================================================
-
-@router.websocket("/chat")
-async def websocket_chat_endpoint(websocket: WebSocket):
-    """
-    WebSocket endpoint para chat con streaming token por token.
-    
-    **Autenticación:** 
-    - Enviar JWT en query param: `?token=...`
-    - O en header: `Authorization: Bearer ...`
-    
-    **Formato de mensajes enviados por el cliente:**
-    ```json
-    {
-        "type": "query",
-        "session_id": "uuid",
-        "document_type_id": 1,
-        "document_number": "123456",
-        "question": "¿Cuáles son las últimas citas?"
-    }
-    ```
-    
-    **Formato de mensajes recibidos del servidor:**
-    - `connected`: Conexión exitosa
-    - `status`: Actualización de estado del proceso
-    - `stream_start`: Inicio del streaming de tokens
-    - `token`: Cada token individual del LLM
-    - `stream_end`: Fin del streaming
-    - `complete`: Respuesta completa con metadata
-    - `error`: Errores durante el proceso
-    - `pong`: Respuesta a ping (keep-alive)
-    """
-    
-    session_id = None
-    temp_session = f"temp_{uuid.uuid4().hex[:8]}"
-    
-    try:
-        # 1. AUTENTICAR
-        user_data = await authenticate_websocket(websocket)
-        if not user_data:
-            return
+        }
         
-        # 2. CONECTAR
-        await manager.connect(websocket, temp_session)
+        .message-avatar {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 18px;
+            flex-shrink: 0;
+        }
         
-        # 3. ENVIAR MENSAJE DE BIENVENIDA
-        await websocket.send_json({
-            "type": "connected",
-            "user_id": user_data.get("user_id"),
-            "message": "✅ Conectado exitosamente al chat médico"
-        })
+        .message.user .message-avatar {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
         
-        # 4. LOOP PRINCIPAL: ESCUCHAR MENSAJES
-        while True:
-            # Recibir mensaje del cliente
-            try:
-                data = await asyncio.wait_for(
-                    websocket.receive_text(),
-                    timeout=300  # 5 minutos de inactividad máxima
-                )
-            except asyncio.TimeoutError:
-                logger.info(f"⏱️ Timeout de inactividad - Session: {session_id or temp_session}")
-                break
+        .message.assistant .message-avatar {
+            background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+        }
+        
+        .message-content {
+            flex: 1;
+        }
+        
+        .message-header {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 5px;
+        }
+        
+        .message-sender {
+            font-weight: 600;
+            font-size: 14px;
+            color: #333;
+        }
+        
+        .message-time {
+            font-size: 12px;
+            color: #999;
+        }
+        
+        .message-text {
+            background: white;
+            padding: 12px 16px;
+            border-radius: 0 12px 12px 12px;
+            line-height: 1.6;
+            color: #333;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            white-space: pre-wrap;
+        }
+        
+        .message.user .message-text {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border-radius: 12px 0 12px 12px;
+        }
+        
+        /* Status indicator */
+        .status-indicator {
+            padding: 10px 20px;
+            background: #e3f2fd;
+            color: #1976d2;
+            border-radius: 8px;
+            margin: 10px 0;
+            font-size: 13px;
+            text-align: center;
+            display: none;
+        }
+        
+        .status-indicator.show {
+            display: block;
+        }
+        
+        /* Typing indicator */
+        .typing-indicator {
+            display: none;
+            padding: 15px;
+        }
+        
+        .typing-indicator.show {
+            display: flex;
+            gap: 12px;
+        }
+        
+        .typing-dots {
+            display: flex;
+            gap: 4px;
+            padding: 12px 16px;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+        }
+        
+        .typing-dots span {
+            width: 8px;
+            height: 8px;
+            background: #667eea;
+            border-radius: 50%;
+            animation: typing 1.4s infinite;
+        }
+        
+        .typing-dots span:nth-child(2) {
+            animation-delay: 0.2s;
+        }
+        
+        .typing-dots span:nth-child(3) {
+            animation-delay: 0.4s;
+        }
+        
+        @keyframes typing {
+            0%, 60%, 100% {
+                transform: translateY(0);
+            }
+            30% {
+                transform: translateY(-10px);
+            }
+        }
+        
+        /* Input area */
+        .input-area {
+            padding: 20px 25px;
+            background: white;
+            border-top: 1px solid #e0e0e0;
+            border-radius: 0 0 20px 20px;
+        }
+        
+        .input-wrapper {
+            display: flex;
+            gap: 12px;
+        }
+        
+        .input-wrapper textarea {
+            flex: 1;
+            padding: 12px 16px;
+            border: 2px solid #e0e0e0;
+            border-radius: 12px;
+            font-size: 14px;
+            font-family: inherit;
+            resize: none;
+            min-height: 50px;
+            max-height: 120px;
+            transition: border-color 0.3s;
+        }
+        
+        .input-wrapper textarea:focus {
+            outline: none;
+            border-color: #667eea;
+        }
+        
+        .btn-send {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            border: none;
+            padding: 0 24px;
+            border-radius: 12px;
+            font-size: 20px;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+        
+        .btn-send:hover {
+            transform: scale(1.05);
+        }
+        
+        .btn-send:active {
+            transform: scale(0.95);
+        }
+        
+        .btn-send:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        /* Metadata box */
+        .metadata-box {
+            background: #f0f4ff;
+            border-left: 4px solid #667eea;
+            padding: 12px 16px;
+            border-radius: 0 8px 8px 0;
+            margin-top: 10px;
+            font-size: 12px;
+            color: #555;
+        }
+        
+        .metadata-box strong {
+            color: #333;
+        }
+        
+        /* Hidden class */
+        .hidden {
+            display: none !important;
+        }
+        
+        /* Scrollbar personalizado */
+        .messages-container::-webkit-scrollbar {
+            width: 8px;
+        }
+        
+        .messages-container::-webkit-scrollbar-track {
+            background: #f1f1f1;
+        }
+        
+        .messages-container::-webkit-scrollbar-thumb {
+            background: #c1c1c1;
+            border-radius: 4px;
+        }
+        
+        .messages-container::-webkit-scrollbar-thumb:hover {
+            background: #a1a1a1;
+        }
+    </style>
+</head>
+<body>
+    <!-- ============================================ -->
+    <!-- PANTALLA DE LOGIN -->
+    <!-- ============================================ -->
+    <div class="login-container" id="loginScreen">
+        <div class="login-header">
+            <h1>🏥 Smart Health</h1>
+            <p>Inicia sesión para acceder al chat médico</p>
+        </div>
+        
+        <form id="loginForm" onsubmit="handleLogin(event)">
+            <div class="form-group">
+                <label for="email">📧 Correo Electrónico</label>
+                <input 
+                    type="email" 
+                    id="email" 
+                    placeholder="usuario@ejemplo.com"
+                    required
+                >
+            </div>
             
-            message = json.loads(data)
-            message_type = message.get("type")
+            <div class="form-group">
+                <label for="password">🔒 Contraseña</label>
+                <input 
+                    type="password" 
+                    id="password" 
+                    placeholder="••••••••"
+                    required
+                >
+            </div>
             
-            # ============================================================
-            # MENSAJE TIPO: QUERY
-            # ============================================================
-            if message_type == "query":
-                session_id = message.get("session_id", temp_session)
-                document_type_id = message.get("document_type_id")
-                document_number = message.get("document_number")
-                question = message.get("question")
-                
-                # Validar campos requeridos
-                if not all([document_type_id, document_number, question]):
-                    await websocket.send_json({
-                        "type": "error",
-                        "error": {
-                            "code": "INVALID_REQUEST",
-                            "message": "Faltan campos requeridos (document_type_id, document_number, question)"
-                        }
-                    })
-                    continue
-                
-                # Actualizar session_id en el manager
-                if temp_session in manager.active_connections:
-                    manager.active_connections[session_id] = manager.active_connections.pop(temp_session)
-                    temp_session = session_id
-                
-                logger.info(f"📩 Query recibida - Session: {session_id}")
-                
-                try:
-                    # PASO 1: Buscar paciente
-                    await websocket.send_json({
-                        "type": "status",
-                        "status": "searching_patient",
-                        "message": "🔍 Buscando datos del paciente..."
-                    })
-                    
-                    # Obtener sesión de DB dentro del contexto
-                    db: Session = next(get_db())
-                    
-                    try:
-                        patient_info, clinical_data = fetch_patient_and_records(
-                            db=db,
-                            document_type_id=document_type_id,
-                            document_number=document_number
-                        )
-                    finally:
-                        db.close()
-                    
-                    if not patient_info:
-                        doc_type = get_document_type_name(document_type_id)
-                        await websocket.send_json({
-                            "type": "error",
-                            "error": {
-                                "code": "PATIENT_NOT_FOUND",
-                                "message": f"No se encontró paciente con documento {doc_type} {document_number}"
-                            }
-                        })
-                        continue
-                    
-                    # PASO 2: Vector search
-                    await websocket.send_json({
-                        "type": "status",
-                        "status": "vector_search",
-                        "message": "🔎 Buscando información relevante..."
-                    })
-                    
-                    similar_chunks = []
-                    try:
-                        similar_chunks = await asyncio.wait_for(
-                            search_similar_chunks(
-                                patient_id=patient_info.patient_id,
-                                question=question,
-                                k=15,
-                                min_score=0.3
-                            ),
-                            timeout=VECTOR_SEARCH_TIMEOUT
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning(f"⏱️ Vector search timeout - Session: {session_id}")
-                    except Exception as e:
-                        logger.warning(f"⚠️ Vector search falló: {type(e).__name__}")
-                    
-                    # PASO 3: Construir contexto
-                    await websocket.send_json({
-                        "type": "status",
-                        "status": "building_context",
-                        "message": "📝 Preparando contexto clínico..."
-                    })
-                    
-                    context = build_context_from_real_data(
-                        patient_info=patient_info,
-                        clinical_records=clinical_data.records,
-                        similar_chunks=similar_chunks
-                    )
-                    
-                    # PASO 4: Generar respuesta con streaming
-                    await websocket.send_json({
-                        "type": "status",
-                        "status": "generating",
-                        "message": "🤖 Generando respuesta..."
-                    })
-                    
-                    full_response = await asyncio.wait_for(
-                        stream_llm_response(websocket, question, context, session_id),
-                        timeout=LLM_TIMEOUT
-                    )
-                    
-                    if not full_response:
-                        continue
-                    
-                    # PASO 5: Enviar respuesta completa con metadata
-                    full_name = f"{patient_info.first_name} {patient_info.first_surname}"
-                    if patient_info.second_surname:
-                        full_name += f" {patient_info.second_surname}"
-                    
-                    await websocket.send_json({
-                        "type": "complete",
-                        "session_id": session_id,
-                        "timestamp": datetime.utcnow().isoformat() + "Z",
-                        "patient_info": {
-                            "patient_id": patient_info.patient_id,
-                            "full_name": full_name,
-                            "document_type": get_document_type_name(document_type_id),
-                            "document_number": document_number
-                        },
-                        "answer": {
-                            "text": full_response,
-                            "confidence": 0.85,
-                            "model_used": llm_service.model
-                        },
-                        "metadata": {
-                            "total_records_analyzed": (
-                                len(clinical_data.records.appointments) +
-                                len(clinical_data.records.medical_records) +
-                                len(clinical_data.records.prescriptions) +
-                                len(clinical_data.records.diagnoses)
-                            ),
-                            "vector_chunks_used": len(similar_chunks)
-                        }
-                    })
-                    
-                    logger.info(f"✅ Query completada - Session: {session_id}")
-                
-                except asyncio.TimeoutError:
-                    logger.error(f"⏱️ Timeout total del request - Session: {session_id}")
-                    await websocket.send_json({
-                        "type": "error",
-                        "error": {
-                            "code": "REQUEST_TIMEOUT",
-                            "message": "La solicitud excedió el tiempo máximo permitido"
-                        }
-                    })
-                
-                except Exception as e:
-                    logger.error(f"❌ Error procesando query: {type(e).__name__}: {e}")
-                    await websocket.send_json({
-                        "type": "error",
-                        "error": {
-                            "code": "PROCESSING_ERROR",
-                            "message": f"Error procesando solicitud: {str(e)}"
-                        }
-                    })
+            <button type="submit" class="btn-login" id="loginBtn">
+                🚀 Iniciar Sesión
+            </button>
             
-            # ============================================================
-            # MENSAJE TIPO: PING (KEEP-ALIVE)
-            # ============================================================
-            elif message_type == "ping":
-                await websocket.send_json({"type": "pong"})
-            
-            # ============================================================
-            # MENSAJE TIPO: DESCONOCIDO
-            # ============================================================
-            else:
-                await websocket.send_json({
-                    "type": "error",
-                    "error": {
-                        "code": "UNKNOWN_MESSAGE_TYPE",
-                        "message": f"Tipo de mensaje desconocido: {message_type}"
-                    }
-                })
+            <div class="error-message" id="loginError"></div>
+        </form>
+    </div>
     
-    except WebSocketDisconnect:
-        logger.info(f"👋 Cliente desconectado voluntariamente - Session: {session_id or temp_session}")
-    
-    except Exception as e:
-        logger.error(f"❌ Error inesperado en WebSocket: {type(e).__name__}: {e}")
-        try:
-            await websocket.send_json({
-                "type": "error",
-                "error": {
-                    "code": "INTERNAL_ERROR",
-                    "message": "Error interno del servidor"
+    <!-- ============================================ -->
+    <!-- PANTALLA DE CHAT -->
+    <!-- ============================================ -->
+    <div class="chat-container" id="chatScreen">
+        <!-- Header -->
+        <div class="chat-header">
+            <div class="chat-header-info">
+                <h2>💬 Chat Médico IA</h2>
+                <p id="userEmail"></p>
+            </div>
+            <button class="btn-logout" onclick="handleLogout()">
+                🚪 Cerrar Sesión
+            </button>
+        </div>
+        
+        <!-- Configuración del paciente -->
+        <div class="patient-config">
+            <select id="docType">
+                <option value="1">CC - Cédula</option>
+                <option value="2">CE - Extranjería</option>
+                <option value="3">TI - Tarjeta Identidad</option>
+                <option value="4">PA - Pasaporte</option>
+                <option value="8">CD - Carné Diplomático</option>
+            </select>
+            <input 
+                type="text" 
+                id="docNumber" 
+                placeholder="Número de documento del paciente"
+            >
+        </div>
+        
+        <!-- Mensajes -->
+        <div class="messages-container" id="messagesContainer">
+            <div class="message assistant">
+                <div class="message-avatar">🤖</div>
+                <div class="message-content">
+                    <div class="message-header">
+                        <span class="message-sender">Asistente Médico</span>
+                        <span class="message-time" id="welcomeTime"></span>
+                    </div>
+                    <div class="message-text">
+                        ¡Hola! Soy tu asistente médico inteligente. 👋
+                        
+Puedo ayudarte a consultar información sobre:
+- 📅 Citas médicas
+- 💊 Medicamentos y prescripciones
+- 🩺 Diagnósticos
+- 📋 Historia clínica
+
+Ingresa el documento del paciente arriba y hazme tu pregunta.
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Status indicator -->
+        <div class="status-indicator" id="statusIndicator"></div>
+        
+        <!-- Typing indicator -->
+        <div class="typing-indicator" id="typingIndicator">
+            <div class="message-avatar">🤖</div>
+            <div class="typing-dots">
+                <span></span>
+                <span></span>
+                <span></span>
+            </div>
+        </div>
+        
+        <!-- Input -->
+        <div class="input-area">
+            <div class="input-wrapper">
+                <textarea 
+                    id="messageInput" 
+                    placeholder="Escribe tu pregunta aquí..."
+                    onkeydown="handleKeyPress(event)"
+                ></textarea>
+                <button class="btn-send" id="sendBtn" onclick="sendMessage()">
+                    🚀
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ============================================
+        // VARIABLES GLOBALES
+        // ============================================
+        
+        let authToken = null;
+        let ws = null;
+        let currentUserEmail = null;
+        
+        const API_BASE = 'http://localhost:8088';
+        const WS_BASE = 'ws://localhost:8088';
+        
+        // ============================================
+        // FUNCIONES DE LOGIN
+        // ============================================
+        
+        async function handleLogin(event) {
+            event.preventDefault();
+            
+            const email = document.getElementById('email').value;
+            const password = document.getElementById('password').value;
+            const loginBtn = document.getElementById('loginBtn');
+            const errorDiv = document.getElementById('loginError');
+            
+            // Deshabilitar botón
+            loginBtn.disabled = true;
+            loginBtn.textContent = '⏳ Iniciando sesión...';
+            errorDiv.classList.remove('show');
+            
+            try {
+                const response = await fetch(`${API_BASE}/auth/login`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({ email, password })
+                });
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    authToken = data.access_token;
+                    currentUserEmail = email;
+                    
+                    // Mostrar chat
+                    document.getElementById('loginScreen').style.display = 'none';
+                    document.getElementById('chatScreen').classList.add('active');
+                    document.getElementById('userEmail').textContent = email;
+                    document.getElementById('welcomeTime').textContent = getCurrentTime();
+                    
+                    // Conectar WebSocket
+                    connectWebSocket();
+                    
+                } else {
+                    const error = await response.json();
+                    showError(error.detail || 'Credenciales incorrectas');
                 }
-            })
-        except:
-            pass
-    
-    finally:
-        # Limpiar conexión
-        manager.disconnect(session_id or temp_session)
+                
+            } catch (error) {
+                showError('Error de conexión. ¿Está corriendo FastAPI?');
+                console.error('Error:', error);
+            } finally {
+                loginBtn.disabled = false;
+                loginBtn.textContent = '🚀 Iniciar Sesión';
+            }
+        }
+        
+        function showError(message) {
+            const errorDiv = document.getElementById('loginError');
+            errorDiv.textContent = `❌ ${message}`;
+            errorDiv.classList.add('show');
+        }
+        
+        function handleLogout() {
+            if (ws) {
+                ws.close();
+            }
+            authToken = null;
+            currentUserEmail = null;
+            
+            document.getElementById('chatScreen').classList.remove('active');
+            document.getElementById('loginScreen').style.display = 'block';
+            
+            // Limpiar formulario
+            document.getElementById('email').value = '';
+            document.getElementById('password').value = '';
+            
+            // Limpiar mensajes (excepto el de bienvenida)
+            const container = document.getElementById('messagesContainer');
+            const messages = container.querySelectorAll('.message');
+            messages.forEach((msg, index) => {
+                if (index > 0) msg.remove();
+            });
+        }
+        
+        // ============================================
+        // FUNCIONES DE WEBSOCKET
+        // ============================================
+        
+        function connectWebSocket() {
+            if (!authToken) return;
+            
+            const wsUrl = `${WS_BASE}/ws/chat?token=${authToken}`;
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = () => {
+                console.log('✅ WebSocket conectado');
+            };
+            
+            ws.onmessage = handleWebSocketMessage;
+            
+            ws.onerror = (error) => {
+                console.error('❌ Error WebSocket:', error);
+                showStatus('Error de conexión con el servidor', 'error');
+            };
+            
+            ws.onclose = () => {
+                console.log('🔌 WebSocket desconectado');
+            };
+        }
+        
+        let currentResponse = "";
+        let currentMessageDiv = null;
+        
+        function handleWebSocketMessage(event) {
+            const data = JSON.parse(event.data);
+            
+            switch(data.type) {
+                case 'connected':
+                    console.log('✅', data.message);
+                    break;
+                    
+                case 'status':
+                    showStatus(data.message);
+                    break;
+                    
+                case 'stream_start':
+                    currentResponse = "";
+                    currentMessageDiv = addAssistantMessage('');
+                    showTyping(false);
+                    break;
+                    
+                case 'token':
+                    currentResponse += data.token;
+                    if (currentMessageDiv) {
+                        const textDiv = currentMessageDiv.querySelector('.message-text');
+                        textDiv.textContent = currentResponse;
+                        scrollToBottom();
+                    }
+                    break;
+                    
+                case 'stream_end':
+                    hideStatus();
+                    break;
+                    
+                case 'complete':
+                    // Agregar metadata
+                    if (currentMessageDiv) {
+                        const meta = data.metadata;
+                        const patient = data.patient_info;
+                        const metaBox = document.createElement('div');
+                        metaBox.className = 'metadata-box';
+                        metaBox.innerHTML = `
+                            <strong>📊 Información:</strong><br>
+                            • Paciente: ${patient.full_name}<br>
+                            • Registros: ${meta.total_records_analyzed} | 
+                            Tiempo: ${meta.query_time_ms}ms | 
+                            Confianza: ${(data.answer.confidence * 100).toFixed(0)}%
+                        `;
+                        currentMessageDiv.querySelector('.message-content').appendChild(metaBox);
+                    }
+                    
+                    enableInput();
+                    hideStatus();
+                    break;
+                    
+                case 'error':
+                    const errorMsg = data.error.message;
+                    addAssistantMessage(`❌ Error: ${errorMsg}`);
+                    enableInput();
+                    hideStatus();
+                    showTyping(false);
+                    break;
+            }
+        }
+        
+        // ============================================
+        // FUNCIONES DE MENSAJES
+        // ============================================
+        
+        function sendMessage() {
+            const input = document.getElementById('messageInput');
+            const docType = document.getElementById('docType').value;
+            const docNumber = document.getElementById('docNumber').value.trim();
+            const question = input.value.trim();
+            
+            if (!docNumber) {
+                alert('Por favor ingresa el número de documento del paciente');
+                return;
+            }
+            
+            if (!question) {
+                return;
+            }
+            
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                alert('No hay conexión con el servidor');
+                return;
+            }
+            
+            // Agregar mensaje del usuario
+            addUserMessage(question);
+            
+            // Limpiar input
+            input.value = '';
+            
+            // Deshabilitar input
+            disableInput();
+            showTyping(true);
+            
+            // Enviar query
+            const query = {
+                type: "query",
+                session_id: `session-${Date.now()}`,
+                document_type_id: parseInt(docType),
+                document_number: docNumber,
+                question: question
+            };
+            
+            ws.send(JSON.stringify(query));
+        }
+        
+        function addUserMessage(text) {
+            const container = document.getElementById('messagesContainer');
+            
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message user';
+            messageDiv.innerHTML = `
+                <div class="message-avatar">👤</div>
+                <div class="message-content">
+                    <div class="message-header">
+                        <span class="message-sender">Tú</span>
+                        <span class="message-time">${getCurrentTime()}</span>
+                    </div>
+                    <div class="message-text">${escapeHtml(text)}</div>
+                </div>
+            `;
+            
+            container.appendChild(messageDiv);
+            scrollToBottom();
+        }
+        
+        function addAssistantMessage(text) {
+            const container = document.getElementById('messagesContainer');
+            
+            const messageDiv = document.createElement('div');
+            messageDiv.className = 'message assistant';
+            messageDiv.innerHTML = `
+                <div class="message-avatar">🤖</div>
+                <div class="message-content">
+                    <div class="message-header">
+                        <span class="message-sender">Asistente Médico</span>
+                        <span class="message-time">${getCurrentTime()}</span>
+                    </div>
+                    <div class="message-text">${escapeHtml(text)}</div>
+                </div>
+            `;
+            
+            container.appendChild(messageDiv);
+            scrollToBottom();
+            
+            return messageDiv;
+        }
+        
+        // ============================================
+        // FUNCIONES AUXILIARES
+        // ============================================
+        
+        function disableInput() {
+            document.getElementById('messageInput').disabled = true;
+            document.getElementById('sendBtn').disabled = true;
+        }
+        
+        function enableInput() {
+            document.getElementById('messageInput').disabled = false;
+            document.getElementById('sendBtn').disabled = false;
+            document.getElementById('messageInput').focus();
+        }
+        
+        function showStatus(message) {
+            const status = document.getElementById('statusIndicator');
+            status.textContent = message;
+            status.classList.add('show');
+        }
+        
+        function hideStatus() {
+            const status = document.getElementById('statusIndicator');
+            status.classList.remove('show');
+        }
+        
+        function showTyping(show) {
+            const typing = document.getElementById('typingIndicator');
+            if (show) {
+                typing.classList.add('show');
+                scrollToBottom();
+            } else {
+                typing.classList.remove('show');
+            }
+        }
+        
+        function scrollToBottom() {
+            const container = document.getElementById('messagesContainer');
+            setTimeout(() => {
+                container.scrollTop = container.scrollHeight;
+            }, 100);
+        }
+        
+        function getCurrentTime() {
+            const now = new Date();
+            return now.toLocaleTimeString('es-ES', { 
+                hour: '2-digit', 
+                minute: '2-digit' 
+            });
+        }
+        
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+        
+        function handleKeyPress(event) {
+            if (event.key === 'Enter' && !event.shiftKey) {
+                event.preventDefault();
+                sendMessage();
+            }
+        }
+        
+        // Auto-resize textarea
+        document.addEventListener('DOMContentLoaded', () => {
+            const textarea = document.getElementById('messageInput');
+            textarea.addEventListener('input', function() {
+                this.style.height = 'auto';
+                this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+            });
+        });
+    </script>
+</body>
+</html>
