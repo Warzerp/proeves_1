@@ -1,0 +1,9 @@
+curl -X POST "http://localhost:8088/query/" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "user_id": 1,
+    "session_id": "8a5988d2-db02-4627-87f6-a5898f492ab3",
+    "document_type_id": 8,
+    "document_number": "30995750",
+    "question": "¿El paciente Laura Morales tiene alguna condición médica?"
+  }'
