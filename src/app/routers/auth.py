@@ -1,8 +1,10 @@
+# src/app/routers/auth.py
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from ..schemas.user import UserCreate, UserLogin, UserResponse, TokenResponse
-from ..database.database import get_db
-from ..services.auth_service import AuthService
+from app.schemas.user import UserCreate, UserLogin, UserResponse, TokenResponse
+from app.database.database import get_db
+from app.services.auth_service import AuthService  # ← Import directo
 
 router = APIRouter(
     prefix="/auth",
